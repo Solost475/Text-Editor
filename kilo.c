@@ -83,8 +83,6 @@ void editorRefreshScreen();
 
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
-char *editorPrompt(char *prompt);
-
 /*** terminal ***/
 
 void die(const char *s) {
@@ -443,7 +441,7 @@ void editorFindCallback(char *query, int key) {
   static int direction = 1;
   if (key == '\r' || key == '\x1b') {
     last_match = -1;
-    direction = 1;//向下
+    direction = 1;
     return;
   } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
     direction = 1;
@@ -453,12 +451,18 @@ void editorFindCallback(char *query, int key) {
     last_match = -1;
     direction = 1;
   }
+  if (last_match == -1) direction = 1;
+  int current = last_match;
   int i;
   for (i = 0; i < E.numrows; i++) {
-    erow *row = &E.row[i];
+    current += direction;
+    if (current == -1) current = E.numrows - 1;
+    else if (current == E.numrows) current = 0;
+    erow *row = &E.row[current];
     char *match = strstr(row->render, query);
     if (match) {
-      E.cy = i;
+      last_match = current;
+      E.cy = current;
       E.cx = editorRowRxToCx(row, match - row->render);
       E.rowoff = E.numrows;
       break;
