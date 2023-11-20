@@ -59,7 +59,7 @@ enum editorHighlight {
 struct editorSyntax {
   char *filetype;
   char **filematch;
-  int flags;
+  int flags;//是否突出显示数字以及是否突出显示该文件类型的字符串的标志
 };
 
 typedef struct erow {
@@ -84,6 +84,7 @@ struct editorConfig {
   char *filename; //文件名
   char statusmsg[80]; //储存状态信息
   time_t statusmsg_time; //状态信息时间戳
+  struct editorSyntax *syntax;//指向当前 editorSyntax 结构的指针
   struct termios orig_termios;
 };
 
@@ -262,17 +263,20 @@ int is_separator(int c) {
 void editorUpdateSyntax(erow *row) {
   row->hl = realloc(row->hl, row->rsize);
   memset(row->hl, HL_NORMAL, row->rsize);
+  if (E.syntax == NULL) return;
   int prev_sep = 1;
   int i = 0;
   while (i < row->rsize) {
-  char c = row->render[i];
+    char c = row->render[i];
     unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
-    if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) ||
-        (c == '.' && prev_hl == HL_NUMBER)) {
-      row->hl[i] = HL_NUMBER;
-      i++;
-      prev_sep = 0;
-      continue;
+    if (E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
+      if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) ||
+          (c == '.' && prev_hl == HL_NUMBER)) {
+        row->hl[i] = HL_NUMBER;
+        i++;
+        prev_sep = 0;
+        continue;
+      }
     }
     prev_sep = is_separator(c);
     i++;
@@ -284,6 +288,29 @@ int editorSyntaxToColor(int hl) {
     case HL_NUMBER: return 31;//数字颜色
     case HL_MATCH: return 34;//搜索结果颜色
     default: return 37;//默认颜色
+  }
+}
+
+void editorSelectSyntaxHighlight() {
+  E.syntax = NULL;
+  if (E.filename == NULL) return;
+  char *ext = strrchr(E.filename, '.');
+  for (unsigned int j = 0; j < HLDB_ENTRIES; j++) {
+    struct editorSyntax *s = &HLDB[j];
+    unsigned int i = 0;
+    while (s->filematch[i]) {
+      int is_ext = (s->filematch[i][0] == '.');
+      if ((is_ext && ext && !strcmp(ext, s->filematch[i])) ||
+          (!is_ext && strstr(E.filename, s->filematch[i]))) {
+        E.syntax = s;
+        int filerow;
+        for (filerow = 0; filerow < E.numrows; filerow++) {
+          editorUpdateSyntax(&E.row[filerow]);
+        }
+        return;
+      }
+      i++;
+    }
   }
 }
 
@@ -454,18 +481,16 @@ char *editorRowsToString(int *buflen) {
 void editorOpen(char *filename) {
   free(E.filename);
   E.filename = strdup(filename);
-
+  editorSelectSyntaxHighlight();
   FILE *fp = fopen(filename, "r");
   if (!fp) die("fopen");
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
-  linelen = getline(&line, &linecap, fp);
-  if (linelen != -1) {
+  while ((linelen = getline(&line, &linecap, fp)) != -1) {
     while (linelen > 0 && (line[linelen - 1] == '\n' ||
                            line[linelen - 1] == '\r'))
       linelen--;
-    // editorAppendRow(line, linelen);
     editorInsertRow(E.numrows, line, linelen);
   }
   free(line);
@@ -480,6 +505,7 @@ void editorSave() {
       editorSetStatusMessage("Save aborted");
       return;
     }
+    editorSelectSyntaxHighlight();
   }
   int len;
   char *buf = editorRowsToString(&len);
@@ -564,7 +590,6 @@ void editorFind() {
   }
 }
 
-
 /*** append buffer ***/
 
 struct abuf {
@@ -576,8 +601,8 @@ struct abuf {
 
 void abAppend(struct abuf *ab, const char *s, int len) {
   char *new = realloc(ab->b, ab->len + len);
-
-  if(new == NULL) return;
+  
+  if (new == NULL) return;
   memcpy(&new[ab->len], s, len);
   ab->b = new;
   ab->len += len;
@@ -593,6 +618,9 @@ void editorScroll() {
   E.rx = 0;
   if (E.cy < E.numrows) {
     E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+  }
+  if (E.cy < E.rowoff) {
+    E.rowoff = E.cy;
   }
   if (E.cy >= E.rowoff + E.screenrows) {
     E.rowoff = E.cy - E.screenrows + 1;
@@ -664,8 +692,8 @@ void editorDrawStatusBar(struct abuf *ab) {
   int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
     E.filename ? E.filename : "[No Name]", E.numrows,
     E.dirty ? "(modified)" : "");
-  int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
-    E.cy + 1, E.numrows);
+  int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
+    E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
   if (len > E.screencols) len = E.screencols;
   abAppend(ab, status, len);
   while (len < E.screencols) {
@@ -690,37 +718,30 @@ void editorDrawMessageBar(struct abuf *ab) {
 }
 
 void editorRefreshScreen() {
-  editorScroll();
+  
   /*
   write（）调用中的4意味着我们向终端写入4个字节。
   第一个字节是\x1b，它是转义字符，或者十进制的27。(Try请记住，我们会经常使用它。）
   其他三个字节是[2]。
   */
+  editorScroll();
+
   struct abuf ab = ABUF_INIT;
+
   abAppend(&ab, "\x1b[?25l", 6);
-  // abAppend(&ab, "\x1b[2J", 4);
   abAppend(&ab, "\x1b[H", 3);
-
-
-  // write(STDOUT_FILENO, "\x1b[2J", 4);
-  // write(STDOUT_FILENO, "\x1b[H", 3);
 
   editorDrawRows(&ab);
   editorDrawStatusBar(&ab);
   editorDrawMessageBar(&ab);
 
   char buf[32];
-  // snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
-  // snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, E.cx + 1);
-  // snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-  //                                           (E.cx - E.coloff) + 1);
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
                                             (E.rx - E.coloff) + 1);
   abAppend(&ab, buf, strlen(buf));
 
-  // abAppend(&ab, "\x1b[H", 3);
   abAppend(&ab, "\x1b[?25h", 6);
-  // write(STDOUT_FILENO, "\x1b[H", 3);
+  
   write(STDOUT_FILENO, ab.b, ab.len);
   abFree(&ab);
 }
@@ -876,6 +897,7 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
+
 void initEditor() {
   E.cx = 0;
   E.cy = 0;
@@ -888,6 +910,8 @@ void initEditor() {
   E.filename = NULL;
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
+  E.syntax = NULL;
+
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
 }
