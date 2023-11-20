@@ -897,7 +897,6 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
-
 void initEditor() {
   E.cx = 0;
   E.cy = 0;
