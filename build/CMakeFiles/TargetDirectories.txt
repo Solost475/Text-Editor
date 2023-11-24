@@ -1,3 +1,0 @@
-/home/amarantos475/Text Editor/build/CMakeFiles/kilo.dir
-/home/amarantos475/Text Editor/build/CMakeFiles/edit_cache.dir
-/home/amarantos475/Text Editor/build/CMakeFiles/rebuild_cache.dir

@@ -1,1 +1,0 @@
-/usr/bin/cc -rdynamic CMakeFiles/kilo.dir/kilo.c.o -o kilo 
