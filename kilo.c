@@ -49,6 +49,7 @@ enum editorKey {
 enum editorHighlight {
   HL_NORMAL = 0,//正常文本
   HL_COMMENT,//多彩单行评论
+  HL_MLCOMMENT,//彩色多行注释
   HL_KEYWORD1,
   HL_KEYWORD2,//多彩关键字
   HL_STRING,//字符串
@@ -66,15 +67,19 @@ struct editorSyntax {
   char **filematch;
   char **keywords;//使用指针的指针（二重指针）可以提供更大的灵活性和动态性，使我们能够处理动态大小的关键字数组，并且能够轻松地传递和修改指向该数组的指针。
   char *singleline_comment_start;//每种语言指定自己的
+  char *multiline_comment_start;
+  char *multiline_comment_end;//多行注释
   int flags;//是否突出显示数字以及是否突出显示该文件类型的字符串的标志
 };
 
 typedef struct erow {
+  int idx;//自己再文件中的索引
   int size;
   int rsize;
   char *chars;
   char *render;
   unsigned char *hl;
+  int hl_open_comment;//查看前一行的是不是评论
 } erow;
 
 // struct termios orig_termios;//原始状态
@@ -112,7 +117,7 @@ struct editorSyntax HLDB[] = {
     "c",
     C_HL_extensions,
     C_HL_keywords,
-    "//",
+    "//", "/*", "*/",
     HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
   },
 };
@@ -283,10 +288,17 @@ void editorUpdateSyntax(erow *row) {
   char **keywords = E.syntax->keywords;
 
   char *scs = E.syntax->singleline_comment_start;
+  char *mcs = E.syntax->multiline_comment_start;
+  char *mce = E.syntax->multiline_comment_end;
+
   int scs_len = scs ? strlen(scs) : 0;
+  int mcs_len = mcs ? strlen(mcs) : 0;
+  int mce_len = mce ? strlen(mce) : 0;
 
   int prev_sep = 1;//将 prev_sep 设置为 1，以便在突出显示字符串后，结束引号被视为分隔符。
   int in_string = 0;//前字符是否是结束引号（c == in_string），如果是，我们将 in_string 重置为 0。
+  int in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);//跟踪是否还在多行注释中
+
   int i = 0;
   while (i < row->rsize) {
     char c = row->render[i];
@@ -296,6 +308,27 @@ void editorUpdateSyntax(erow *row) {
       if (!strncmp(&row->render[i], scs, scs_len)) {
         memset(&row->hl[i], HL_COMMENT, row->rsize - i);
         break;
+      }
+    }
+
+    if (mcs_len && mce_len && !in_string) {
+      if (in_comment) {
+        row->hl[i] = HL_MLCOMMENT;
+        if (!strncmp(&row->render[i], mce, mce_len)) {
+          memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+          i += mce_len;
+          in_comment = 0;
+          prev_sep = 1;
+          continue;
+        } else {
+          i++;
+          continue;
+        }
+      } else if (!strncmp(&row->render[i], mcs, mcs_len)) {//检查是否位于注释的末尾
+        memset(&row->hl[i], HL_MLCOMMENT, mcs_len);
+        i += mcs_len;
+        in_comment = 1;
+        continue;
       }
     }
 
@@ -352,11 +385,17 @@ void editorUpdateSyntax(erow *row) {
     prev_sep = is_separator(c);
     i++;
   }
+
+  int changed = (row->hl_open_comment != in_comment);
+  row->hl_open_comment = in_comment;
+  if (changed && row->idx + 1 < E.numrows)
+    editorUpdateSyntax(&E.row[row->idx + 1]);
 }
 
 int editorSyntaxToColor(int hl) {
   switch (hl) {
-    case HL_COMMENT: return 36;
+    case HL_COMMENT:
+    case HL_MLCOMMENT: return 36;
     case HL_KEYWORD1: return 33;
     case HL_KEYWORD2: return 32;
     case HL_STRING: return 35;
@@ -441,6 +480,10 @@ void editorInsertRow(int at, char *s, size_t len) {
   if (at < 0 || at > E.numrows) return;
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
   memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+  for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++;
+
+  E.row[at].idx = at;
+
   E.row[at].size = len;
   E.row[at].chars = malloc(len + 1);
   memcpy(E.row[at].chars, s, len);
@@ -448,6 +491,7 @@ void editorInsertRow(int at, char *s, size_t len) {
   E.row[at].rsize = 0;
   E.row[at].render = NULL;
   E.row[at].hl = NULL;
+  E.row[at].hl_open_comment = 0;
   editorUpdateRow(&E.row[at]);
   E.numrows++;
   E.dirty++;
@@ -463,6 +507,7 @@ void editorDelRow(int at) {
   if (at < 0 || at >= E.numrows) return;
   editorFreeRow(&E.row[at]);
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+  for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
   E.numrows--;
   E.dirty++;
 }
@@ -737,7 +782,17 @@ void editorDrawRows(struct abuf *ab) {
       int current_color = -1;
       int j;
       for (j = 0; j < len; j++) {
-        if (hl[j] == HL_NORMAL) {
+        if (iscntrl(c[j])) {//判断是否是控制命令
+          char sym = (c[j] <= 26) ? '@' + c[j] : '?';//如果遇到不能打印的字符，ctrl-A这种就将他转换为A,@位于A之前，将他转换为字符，否则输出？代表不能打印
+          abAppend(ab, "\x1b[7m", 4);
+          abAppend(ab, &sym, 1);
+          abAppend(ab, "\x1b[m", 3);// <esc>[m 关闭所有文本格式，包括颜色
+          if (current_color != -1) {
+            char buf[16];
+            int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);//恢复原来的颜色
+            abAppend(ab, buf, clen);
+          }
+        } else if (hl[j] == HL_NORMAL) {
           if (current_color != -1) {
             abAppend(ab, "\x1b[39m", 5);
             current_color = -1;
